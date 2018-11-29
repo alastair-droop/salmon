@@ -1,0 +1,75 @@
+# Get the necessary Python functions:
+from os import makedirs
+from os.path import exists, expanduser, expandvars
+import uuid
+
+def checkDir(d, make_dir='no', check_write=False):
+    d = expandvars(expanduser(d))
+    if not exists(d):
+        if make_dir == 'yes':
+            makedirs(d)
+            message('created directory "%s"' % d)
+        else: raise Exception('directory "%s" does not exist' % d)
+    require(d, 'PATH_READABLE')
+    if check_write is True: require(d, 'PATH_WRITABLE')
+
+section('SALMON_QUANT-{SAMPLE}', 'Perform Salmon quantification on the raw sample {SAMPLE}.')
+if('{WHOLE_NODE}' == 'yes'):
+    limits(h_rt='{MAX_TIME}', nodes=1)
+else:
+    limits(h_rt='{MAX_TIME}', h_vmem='{MAX_MEM}')
+    options('pe smp {MAX_THREADS}')
+options('V', 'cwd', 'notify')
+
+# Check the log diectory:
+checkDir('{LOG_DIR}', make_dir='{MKDIRS}', check_write=False)
+outputs('{LOG_DIR}')
+
+# Check the output directories are OK:
+for d in ['{BASE_DIR}', '{FASTQ_TRIMMED_DIR}', '{QUANT_DIR}', '{TEMP_DIR}', '{STATS_DIR}', '{COUNTS_DIR}']: checkDir(d, make_dir='{MKDIRS}', check_write=True)
+
+# Check that the read-only input directories are OK:
+for d in ['{FASTQ_RAW_DIR}', '{INDEX_DIR}']: checkDir(d, make_dir=False, check_write=False)
+
+# Get the UUID for temporary files:
+run_uuid = uuid.uuid4()
+message('run temporary file UUID = "%s"' % run_uuid)
+
+# Build the input & output filenames:
+pairs = ['1', '2']
+files = dict()
+for t in ['raw', 'temp_trimmed', 'trimmed']: files[t] = dict()
+for pair in pairs:
+    raw_file = expandvars(expanduser('{FASTQ_RAW_DIR}/{FASTQ_RAW_FILESTEM}' % pair))
+    temp_trimmed_file = expandvars(expanduser('{TEMP_DIR}/%s_%s-trimmed.fastq.gz' % (run_uuid, pair)))
+    trimmed_file = expandvars(expanduser('{FASTQ_TRIMMED_DIR}/{FASTQ_TRIMMED_FILESTEM}' % pair))
+    message('input fastq (pair %s) is "%s"' % (pair, raw_file))
+    message('trimmed fastq (pair %s) is "%s"' % (pair, trimmed_file))
+    files['raw'][pair] = raw_file
+    files['trimmed'][pair] = trimmed_file
+    files['temp_trimmed'][pair] = temp_trimmed_file
+    require(raw_file, 'PATH_READABLE')
+
+# Test the executables:
+for e in ['{CUTADAPT_EXEC}', '{CUTADAPT_STATS_EXEC}', '{SALMON_EXEC}']: require(e, 'PATH_EXECUTABLE')
+
+# Build & execute the cutadapt pre-processing step:
+if '{RUN_CUTADAPT}' == 'yes':
+    cutadapt_exec_str = '{CUTADAPT_EXEC} --cores={MAX_THREADS} -m{CUTADAPT_MIN_LENGTH} -n{CUTADAPT_MAX_ITERATIONS} -a{CUTADAPT_ADAPTER_1} -A{CUTADAPT_ADAPTER_2} -o%s -p%s %s %s ' % (files['temp_trimmed']['1'], files['temp_trimmed']['2'], files['raw']['1'], files['raw']['2'])
+    cutadapt_log = '{LOG_DIR}/cutadapt-{SAMPLE}.log'
+    cutadapt_stats = '{STATS_DIR}/cutadapt-stats-{SAMPLE}.txt'
+    message('cutadapt command: %s' % cutadapt_exec_str)
+    command('%s > %s' % (cutadapt_exec_str, cutadapt_log), name='run_cutadapt')
+    for pair in pairs: command('mv %s %s' % (files['temp_trimmed'][pair], files['trimmed'][pair]), name='mv_cutadapt_output_%s' % pair)
+    command('{CUTADAPT_STATS_EXEC} %s > %s' % (cutadapt_log, cutadapt_stats), name='cutadapt_stats')
+else:
+    message('skipping cutadapt')
+    for pair in pairs: command('ln -s %s %s' % (files['raw'][pair], files['trimmed'][pair]), name='link_trimmed_%s' % pair)
+
+# Build & execute the Salmon quantification step:
+salmon_exec_str = '{SALMON_EXEC} quant -p {MAX_THREADS} -l {SALMON_LIBTYPE} -i {INDEX_DIR} --seqBias --gcBias --writeUnmappedNames -1 %s -2 %s -o {QUANT_DIR}' % (files['trimmed']['1'], files['trimmed']['2'])
+salmon_log = '{LOG_DIR}/salmon-{SAMPLE}.log'
+message('salmon command: %s' % salmon_exec_str)
+command('%s &> %s' % (salmon_exec_str, salmon_log), name='run_salmon')
+command('ln -s {QUANT_DIR}/quant.sf {COUNTS_DIR}/{SAMPLE}.counts', name='link_quant')
+    
